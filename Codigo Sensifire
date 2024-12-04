@@ -1,0 +1,182 @@
+#include <stdio.h>
+#include <math.h>
+#include "pico/stdlib.h"
+#include "pico/cyw43_arch.h"
+#include "hardware/adc.h"
+#include "hardware/gpio.h"
+#include "lwip/apps/mqtt_priv.h"
+
+
+// Configuración de Wi-Fi y MQTT
+#define WIFI_SSID "TeleCentro-54ad-5G"
+#define WIFI_PASSWORD "aluf2737"
+#define MQTT_BROKER_URL "broker.hivemq.com"
+#define MQTT_TOPIC "environment/sensordata"
+
+// Sensores y hardware
+#define RL_VALUE 10.0
+#define VCC 3.3
+#define ADC_MAX 4095
+#define ADC_PIN 28
+#define NTC_PIN 22
+#define BUZZER 14
+#define LED_1 4
+#define LED_2 5
+#define MIN_CO_DETECTION 10.0
+#define MAX_TEMP_LIMIT 40.0
+
+// MQTT
+static ip_addr_t mqtt_ip;
+typedef struct {
+    mqtt_client_t *mqtt_client_inst;
+    struct mqtt_connect_client_info_t mqtt_client_info;
+} MQTT_CLIENT_DATA_T;
+
+MQTT_CLIENT_DATA_T *mqtt;
+
+void inicializar_hardware();
+float leer_acd_voltaje();
+float calcular_concentracion_CO(float voltage);
+double calcular_resistencia_ntc();
+double calcular_temperatura();
+void manejar_alarma(double temperatura, double concentracion_co);
+void publicar_datos(mqtt_client_t *client, double temperatura, double concentracion_co);
+void conectar_mqtt(MQTT_CLIENT_DATA_T *mqtt);
+
+void inicializar_hardware() {
+    stdio_init_all();
+    adc_init();
+    adc_gpio_init(ADC_PIN);
+    adc_gpio_init(NTC_PIN);
+
+    gpio_init(BUZZER);
+    gpio_set_dir(BUZZER, GPIO_OUT);
+    gpio_put(BUZZER, 0);
+
+    gpio_init(LED_1);
+    gpio_set_dir(LED_1, GPIO_OUT);
+    gpio_put(LED_1, 0);
+
+    gpio_init(LED_2);
+    gpio_set_dir(LED_2, GPIO_OUT);
+    gpio_put(LED_2, 0); // LED_2 encendido por defecto para "estado seguro"
+}
+
+float leer_acd_voltaje() {
+    adc_select_input(2); 
+    uint16_t adcValueMq7 = adc_read(); 
+    return (3.3f * adcValueMq7 ) / 4095; 
+}
+
+float calcular_concentracion_CO (float voltage) {
+    float rs_ro_ratio = (3.3 - voltage) / voltage;  // Relación Rs/Ro
+    float ppm = pow(10, ((-0.38 * log10(rs_ro_ratio)) + 0.78)); // Ecuación típica
+    
+    // Normalizar ppm a porcentaje
+    float percentage = (ppm / 1000000.0) * 100.0f;
+    if (percentage > 100.0f) {
+        percentage = 100.0f;
+    }
+    return percentage;
+}
+
+double calcular_resistencia_ntc(int adcValue) {
+    adc_select_input(2); // Selección del canal ADC
+    uint16_t val = adc_read(); // Leer valor ADC
+    float V_val = val * 3.3 / 4095; // Convertir valor ADC a voltaje
+    float R_ntc = 15000.0 / ((3.3 / V_val) - 1); // Actualizar resistencia de referencia a 15 kΩ
+    return R_ntc;
+}
+
+double calcular_temperatura(double R_ntc) {
+    float Ptemp = 0.0;
+    for (int i = 0; i < 11; ++i) {
+        // Cálculo de la temperatura
+        float T = 1 / (log(R_ntc / 10000.0) / 3900.0 + 1 / 298.15); // Fórmula de Steinhart-Hart simplificada
+        float Temp = T - 273.15; // Convertir a Celsius
+        // Sumar las 10 temperaturas
+        Ptemp += Temp;
+    }
+    // Sacar el promedio de las 10 temperaturas leídas
+    Ptemp = Ptemp / 10;
+    return Ptemp;
+}
+
+
+void manejar_alarma(double temperatura, double concentracion_co) {
+    if (concentracion_co > MIN_CO_DETECTION || temperatura > MAX_TEMP_LIMIT) {
+        gpio_put(LED_1, 1); // LED de alarma
+        gpio_put(LED_2, 0); // LED de estado seguro
+        gpio_put(BUZZER, 1); // Activar buzzer
+        printf("¡ALERTA! Temperatura: %.2f °C, CO: %.2f ppm\n", temperatura, concentracion_co);
+    } else {
+        gpio_put(LED_1, 0); // Apagar LED de alarma
+        gpio_put(LED_2, 1); // LED de estado seguro
+        gpio_put(BUZZER, 0); // Apagar buzzer
+        printf("Estado seguro. Temperatura: %.2f °C, CO: %.2f ppm\n", temperatura, concentracion_co);
+    }
+}
+
+void conectar_mqtt(MQTT_CLIENT_DATA_T *mqtt) {
+    err_t err;
+    mqtt->mqtt_client_inst = mqtt_client_new();
+    if (!ip4addr_aton(MQTT_BROKER_URL, &mqtt_ip)) {
+        printf("IP del broker no válida\n");
+        return;
+    }
+
+    err = mqtt_client_connect(mqtt->mqtt_client_inst, &mqtt_ip, MQTT_PORT, NULL, mqtt, &mqtt->mqtt_client_info);
+    if (err != ERR_OK) {
+        printf("Error conectando al broker MQTT: %d\n", err);
+    } else {
+        printf("Conectado al broker MQTT\n");
+    }
+}
+
+void publicar_datos(mqtt_client_t *client, double temperatura, double concentracion_co) {
+    char mensaje[128];
+    snprintf(mensaje, sizeof(mensaje), "{\"temperature\": %.2f, \"co\": %.2f}", temperatura, concentracion_co);
+    err_t err = mqtt_publish(client, MQTT_TOPIC, mensaje, strlen(mensaje), 1, 0, NULL, NULL);
+    if (err != ERR_OK) {
+        printf("Error publicando datos: %d\n", err);
+    } else {
+        printf("Datos publicados: %s\n", mensaje);
+    }
+}
+
+int main() {
+    inicializar_hardware();
+
+    if (cyw43_arch_init_with_country(CYW43_COUNTRY_USA)) {
+        printf("Error inicializando Wi-Fi\n");
+        return -1;
+    }
+
+    cyw43_arch_enable_sta_mode();
+
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000)) {
+        printf("Error conectando a Wi-Fi\n");
+        return -1;
+    }
+    printf("Conectado a Wi-Fi\n");
+
+    mqtt = calloc(1, sizeof(MQTT_CLIENT_DATA_T));
+    conectar_mqtt(mqtt);
+
+    while (true) {
+        if (!mqtt->mqtt_client_inst->conn_state) {
+            printf("Reconectando a MQTT...\n");
+            conectar_mqtt(mqtt);
+        }
+        int adcValueGas =leer_acd_voltaje();
+        double concentracion_co = calcular_concentracion_CO(adcValueGas);
+
+        int adcValueNTC = gpio_get(NTC_PIN);
+        double resistencia_ntc = calcular_resistencia_ntc(adcValueNTC);
+        double temperatura = calcular_temperatura(resistencia_ntc);
+
+        manejar_alarma(temperatura, concentracion_co);
+        publicar_datos(mqtt->mqtt_client_inst, temperatura, concentracion_co);
+        sleep_ms(1000);
+    }
+}
